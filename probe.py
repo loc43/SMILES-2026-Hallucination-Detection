@@ -42,10 +42,15 @@ class HallucinationProbe(nn.Module):
         Args:
             input_dim: Feature vector dimensionality.
         """
+        hidden = min(512, max(128, input_dim // 2))
         self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, hidden),
             nn.ReLU(),
-            nn.Linear(256, 1),
+            nn.Dropout(0.25),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden // 2, 1),
         )
 
     # ------------------------------------------------------------------
@@ -69,7 +74,7 @@ class HallucinationProbe(nn.Module):
         """Train the probe on labelled feature vectors.
 
         Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
+        and optimises with AdamW + ``BCEWithLogitsLoss``.
 
         Args:
             X: Feature matrix of shape ``(n_samples, feature_dim)``.
@@ -79,6 +84,9 @@ class HallucinationProbe(nn.Module):
         Returns:
             ``self`` (for method chaining).
         """
+        torch.manual_seed(42)
+        np.random.seed(42)
+
         X_scaled = self._scaler.fit_transform(X)
 
         self._build_network(X_scaled.shape[1])
@@ -95,15 +103,30 @@ class HallucinationProbe(nn.Module):
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the training loop below.
         # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=2e-3, weight_decay=1e-4)
 
         self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
+        n = X_t.size(0)
+        batch_size = min(64, max(8, n // 4)) if n >= 16 else n
+
+        for epoch in range(500):
+            perm = torch.randperm(n)
+            for start in range(0, n, batch_size):
+                idx = perm[start : start + batch_size]
+                xb = X_t[idx]
+                yb = y_t[idx]
+                optimizer.zero_grad(set_to_none=True)
+                logits = self(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                optimizer.step()
+
+            if epoch > 80 and epoch % 40 == 0:
+                with torch.no_grad():
+                    full_loss = float(criterion(self(X_t), y_t).cpu())
+                if full_loss < 0.02:
+                    break
         # ------------------------------------------------------------------
 
         self.eval()
@@ -175,4 +198,3 @@ class HallucinationProbe(nn.Module):
             logits = self(X_t)
             prob_pos = torch.sigmoid(logits).numpy()
         return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-
