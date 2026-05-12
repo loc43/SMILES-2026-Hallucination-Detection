@@ -20,6 +20,17 @@ from __future__ import annotations
 import torch
 
 
+def _masked_mean(h: torch.Tensor, mask_1d: torch.Tensor) -> torch.Tensor:
+    m = mask_1d.float().unsqueeze(-1)
+    denom = m.sum(dim=0).clamp(min=1.0)
+    return (h * m).sum(dim=0) / denom
+
+
+def _last_real_index(mask_1d: torch.Tensor) -> int:
+    nz = mask_1d.nonzero(as_tuple=False)
+    return int(nz[-1].item())
+
+
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -44,17 +55,40 @@ def aggregate(
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the aggregation below.
     # ------------------------------------------------------------------
+    n_layers, _, hidden_dim = hidden_states.shape
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    lo, hi = 1, n_layers - 1
+    if hi < lo:
+        lo, hi = 0, n_layers - 1
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    fracs = (0.2, 0.35, 0.5, 0.65, 0.8, 1.0)
+    layer_ids: list[int] = []
+    for f in fracs:
+        li = int(lo + f * (hi - lo))
+        li = max(lo, min(li, hi))
+        if li not in layer_ids:
+            layer_ids.append(li)
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    last_pos = _last_real_index(attention_mask)
+    parts: list[torch.Tensor] = []
 
-    return feature
+    for li in layer_ids:
+        h = hidden_states[li]
+        parts.append(_masked_mean(h, attention_mask))
+        parts.append(h[last_pos])
+    mid = layer_ids[len(layer_ids) // 2]
+    h_mid = hidden_states[mid][last_pos]
+    h_fin = hidden_states[layer_ids[-1]][last_pos]
+    parts.append(h_fin - h_mid)
+
+    h_last = hidden_states[layer_ids[-1]]
+    m = attention_mask.float().unsqueeze(-1)
+    mu = _masked_mean(h_last, attention_mask)
+    centered = (h_last - mu) * m
+    var = (centered.pow(2) * m).sum(dim=0) / m.sum(dim=0).clamp(min=1.0)
+    parts.append(torch.sqrt(var + 1e-6))
+
+    return torch.cat(parts, dim=0)
     # ------------------------------------------------------------------
 
 
@@ -84,9 +118,28 @@ def extract_geometric_features(
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the geometric feature extraction below.
     # ------------------------------------------------------------------
+    n_layers, _, _ = hidden_states.shape
+    last_pos = _last_real_index(attention_mask)
+    feats: list[torch.Tensor] = []
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    n_real = float(attention_mask.sum().item())
+    feats.append(torch.tensor([n_real / 512.0], device=hidden_states.device))
+
+    lo, hi = 1, n_layers - 1
+    if hi > lo:
+        a = hidden_states[lo][last_pos]
+        b = hidden_states[hi][last_pos]
+        cos = torch.nn.functional.cosine_similarity(
+            a.unsqueeze(0), b.unsqueeze(0), dim=1, eps=1e-8
+        )
+        feats.append(cos)
+
+    m = attention_mask.bool()
+    h = hidden_states[-1][m]
+    feats.append(torch.tensor([h.norm(p="fro") / (h.numel() ** 0.5 + 1e-8)], device=hidden_states.device))
+
+    return torch.cat(feats, dim=0)
+    # ------------------------------------------------------------------
 
 
 def aggregation_and_feature_extraction(
